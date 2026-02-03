@@ -1,12 +1,10 @@
 # app.py
 # =========================================
 # Grafik Harga Emas Pegadaian (FINAL)
-# - Endpoint: agata.pegadaian.co.id
-# - Auth: apikey + bearer token (JWT)
-# - Data: json_fluktuasi -> priceList[]
+# + Download CSV & Excel
 # =========================================
 # Requirements:
-#   pip install streamlit requests pandas
+#   pip install streamlit requests pandas openpyxl
 #
 # Streamlit Secrets (WAJIB):
 #   PEGADAIAN_APIKEY = "apikey dari DevTools"
@@ -17,6 +15,7 @@ import json
 import requests
 import pandas as pd
 import streamlit as st
+from io import BytesIO
 
 st.set_page_config(page_title="Grafik Harga Emas Pegadaian", layout="wide")
 st.title("📈 Grafik Harga Emas Pegadaian")
@@ -54,7 +53,6 @@ def build_headers():
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        # wajib (case-sensitive di backend)
         "apikey": apikey,
         "authorization": f"Bearer {bearer}",
     }
@@ -76,7 +74,6 @@ def fetch_all_grafik():
             f"responseDesc={resp.get('responseDesc')}"
         )
 
-    # graphql errors
     if "errors" in resp and resp["errors"]:
         raise RuntimeError(json.dumps(resp["errors"], indent=2))
 
@@ -86,12 +83,6 @@ def fetch_all_grafik():
     raise RuntimeError("Response tidak sesuai format GraphQL allGrafik.")
 
 def parse_json_fluktuasi_to_pricelist(js: str):
-    """
-    json_fluktuasi format (sesuai bukti kamu):
-    - Bisa dict: {"priceList":[...], "xAxis":[...], "yAxis":[...]}
-    - Bisa list wrapper: [ { ... } ]
-    Yang kita ambil hanya priceList.
-    """
     obj = json.loads(js)
 
     if isinstance(obj, list) and obj:
@@ -102,31 +93,37 @@ def parse_json_fluktuasi_to_pricelist(js: str):
 
     raise RuntimeError("Key 'priceList' tidak ditemukan pada json_fluktuasi.")
 
-def normalize_pricelist(pricelist: list[dict], tipe: str) -> pd.DataFrame:
+def normalize_pricelist(pricelist: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(pricelist)
 
-    # kolom yang terbukti ada: lastUpdate, hargaBeli, hargaJual
     if "lastUpdate" not in df.columns:
         raise RuntimeError(f"Kolom 'lastUpdate' tidak ada. Kolom tersedia: {list(df.columns)}")
 
     df["tanggal"] = pd.to_datetime(df["lastUpdate"], errors="coerce")
+    df["harga_beli"] = pd.to_numeric(df.get("hargaBeli"), errors="coerce")
+    df["harga_jual"] = pd.to_numeric(df.get("hargaJual"), errors="coerce")
 
-    # harga bisa string
-    if "hargaBeli" in df.columns:
-        df["harga_beli"] = pd.to_numeric(df["hargaBeli"], errors="coerce")
-    else:
-        df["harga_beli"] = pd.NA
-
-    if "hargaJual" in df.columns:
-        df["harga_jual"] = pd.to_numeric(df["hargaJual"], errors="coerce")
-    else:
-        df["harga_jual"] = pd.NA
-
-    out = df[["tanggal", "harga_beli", "harga_jual"]].sort_values("tanggal").reset_index(drop=True)
-
-    # Optional: kalau user pilih "jual", tetap tampilkan harga_jual (harga_beli tetap ada jika tersedia)
-    # Tidak perlu filter kolom.
+    out = (
+        df[["tanggal", "harga_beli", "harga_jual"]]
+        .sort_values("tanggal")
+        .reset_index(drop=True)
+    )
     return out
+
+def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "data") -> bytes:
+    buf = BytesIO()
+    # openpyxl is the default engine for .xlsx
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+        # Optional: autosize columns (simple)
+        ws = writer.sheets[sheet_name]
+        for idx, col in enumerate(df.columns, start=1):
+            max_len = max([len(str(col))] + [len(str(x)) for x in df[col].astype(str).head(200)])
+            ws.column_dimensions[chr(64 + idx)].width = min(max_len + 2, 40)
+
+    buf.seek(0)
+    return buf.getvalue()
 
 # UI controls
 c1, c2, c3 = st.columns([2, 2, 2])
@@ -155,23 +152,31 @@ if st.button("📥 Ambil Data Grafik"):
             st.stop()
 
         pricelist = parse_json_fluktuasi_to_pricelist(rec["json_fluktuasi"])
-        out = normalize_pricelist(pricelist, tipe)
+        out = normalize_pricelist(pricelist)
 
-        # basic sanity
         valid_rows = out.dropna(subset=["tanggal"]).shape[0]
-        if valid_rows == 0:
-            st.warning("Data berhasil diambil tapi tanggal tidak ter-parse. Cek format lastUpdate.")
-        else:
-            st.success(f"Berhasil! Total data: {len(out)} (valid tanggal: {valid_rows})")
-
+        st.success(f"Berhasil! Total data: {len(out)} (valid tanggal: {valid_rows})")
         st.dataframe(out, use_container_width=True)
 
-        st.download_button(
-            "⬇️ Download CSV",
-            data=out.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"pegadaian_grafik_{tipe}_{interval}.csv",
-            mime="text/csv",
-        )
+        # Download buttons
+        colA, colB = st.columns(2)
+
+        with colA:
+            st.download_button(
+                "⬇️ Download CSV",
+                data=out.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"pegadaian_grafik_{tipe}_{interval}.csv",
+                mime="text/csv",
+            )
+
+        with colB:
+            xlsx_bytes = to_excel_bytes(out, sheet_name=f"{tipe}_{interval}")
+            st.download_button(
+                "⬇️ Download Excel",
+                data=xlsx_bytes,
+                file_name=f"pegadaian_grafik_{tipe}_{interval}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
     except Exception as e:
         st.error(str(e))
