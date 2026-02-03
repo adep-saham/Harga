@@ -1,6 +1,6 @@
 # app.py
 # =========================================
-# Grafik Harga Emas Pegadaian (GraphQL)
+# Grafik Harga Emas Pegadaian (FINAL)
 # =========================================
 # Requirements:
 #   pip install streamlit requests pandas
@@ -15,9 +15,9 @@ import requests
 import pandas as pd
 import streamlit as st
 
-# -------------------------------
+# ------------------------------------------------
 # PAGE CONFIG
-# -------------------------------
+# ------------------------------------------------
 st.set_page_config(
     page_title="Grafik Harga Emas Pegadaian",
     layout="wide",
@@ -25,9 +25,9 @@ st.set_page_config(
 
 st.title("📈 Grafik Harga Emas Pegadaian")
 
-# -------------------------------
-# CONSTANTS
-# -------------------------------
+# ------------------------------------------------
+# CONSTANT
+# ------------------------------------------------
 GRAPHQL_URL = "https://agata.pegadaian.co.id/public/webcorp/konven/graphql"
 REFERER = "https://pegadaian.co.id/"
 
@@ -42,9 +42,9 @@ query allGrafik {
 }
 """
 
-# -------------------------------
+# ------------------------------------------------
 # HEADERS
-# -------------------------------
+# ------------------------------------------------
 def build_headers():
     apikey = st.secrets.get("PEGADAIAN_APIKEY", "")
     bearer = st.secrets.get("PEGADAIAN_BEARER", "")
@@ -70,11 +70,12 @@ def build_headers():
         "authorization": f"Bearer {bearer}",
     }
 
-# -------------------------------
+# ------------------------------------------------
 # FETCH GRAPHQL
-# -------------------------------
+# ------------------------------------------------
 def fetch_all_grafik():
     headers = build_headers()
+
     payload = {
         "operationName": "allGrafik",
         "variables": {},
@@ -89,49 +90,64 @@ def fetch_all_grafik():
     )
 
     if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}\n\n{r.text[:1500]}")
+        raise RuntimeError(f"HTTP {r.status_code}\n\n{r.text[:1200]}")
 
     resp = r.json()
 
-    # ❌ Unauthorized / wrapper error
+    # Wrapper unauthorized
     if resp.get("responseCode") and resp.get("data") is None:
         raise RuntimeError(
-            f"Unauthorized / Invalid Token\n"
+            f"Unauthorized / Token Invalid\n"
             f"responseCode={resp.get('responseCode')}\n"
             f"responseDesc={resp.get('responseDesc')}"
         )
 
-    # ❌ GraphQL error
+    # GraphQL error
     if "errors" in resp:
-        raise RuntimeError(f"GraphQL errors:\n{json.dumps(resp['errors'], indent=2)}")
+        raise RuntimeError(json.dumps(resp["errors"], indent=2))
 
-    # ✅ Normal GraphQL
     if "data" in resp and "allGrafik" in resp["data"]:
         return resp["data"]["allGrafik"]
 
     raise RuntimeError(
         "Struktur response tidak dikenali:\n"
-        + json.dumps(resp, indent=2)[:1500]
+        + json.dumps(resp, indent=2)[:1200]
     )
 
-# -------------------------------
-# PARSE json_fluktuasi (DOUBLE JSON)
-# -------------------------------
+# ------------------------------------------------
+# PARSER json_fluktuasi (UNIVERSAL)
+# ------------------------------------------------
 def parse_json_fluktuasi(js: str):
+    """
+    Handle semua variasi Pegadaian:
+    A. { pricedlist: [...] }
+    B. [ { pricedlist: [...] } ]
+    C. [ {...}, {...} ]
+    D. { ... }
+    """
     obj = json.loads(js)
 
-    # kadang dibungkus list
-    if isinstance(obj, list) and obj:
-        obj = obj[0]
+    # CASE: list
+    if isinstance(obj, list) and len(obj) > 0:
+        first = obj[0]
 
-    if not isinstance(obj, dict) or "pricedlist" not in obj:
-        raise RuntimeError("Format json_fluktuasi tidak sesuai.")
+        if isinstance(first, dict) and "pricedlist" in first:
+            return first["pricedlist"]
 
-    return obj["pricedlist"]
+        if isinstance(first, dict):
+            return obj
 
-# -------------------------------
-# UI CONTROLS
-# -------------------------------
+    # CASE: dict
+    if isinstance(obj, dict):
+        if "pricedlist" in obj:
+            return obj["pricedlist"]
+        return [obj]
+
+    raise RuntimeError("Format json_fluktuasi tidak dikenali")
+
+# ------------------------------------------------
+# UI
+# ------------------------------------------------
 col1, col2 = st.columns(2)
 
 with col1:
@@ -145,14 +161,13 @@ with col2:
         step=1,
     )
 
-# -------------------------------
-# MAIN ACTION
-# -------------------------------
+# ------------------------------------------------
+# ACTION
+# ------------------------------------------------
 if st.button("📥 Ambil Data Grafik"):
     try:
         records = fetch_all_grafik()
 
-        # cari record sesuai pilihan
         record = next(
             (
                 r for r in records
@@ -177,10 +192,21 @@ if st.button("📥 Ambil Data Grafik"):
         priced = parse_json_fluktuasi(record["json_fluktuasi"])
         df = pd.DataFrame(priced)
 
-        # normalisasi kolom
-        df["tanggal"] = pd.to_datetime(df.get("lastUpdate"), errors="coerce")
+        # -------------------------------
+        # NORMALISASI KOLOM
+        # -------------------------------
+        if "lastUpdate" in df.columns:
+            df["tanggal"] = pd.to_datetime(df["lastUpdate"], errors="coerce")
+        elif "date" in df.columns:
+            df["tanggal"] = pd.to_datetime(df["date"], errors="coerce")
+        else:
+            df["tanggal"] = pd.NaT
+
         df["harga_beli"] = pd.to_numeric(df.get("hargaBeli"), errors="coerce")
         df["harga_jual"] = pd.to_numeric(df.get("hargaJual"), errors="coerce")
+
+        if "harga" in df.columns and df["harga_jual"].isna().all():
+            df["harga_jual"] = pd.to_numeric(df["harga"], errors="coerce")
 
         out = (
             df[["tanggal", "harga_beli", "harga_jual"]]
@@ -191,7 +217,6 @@ if st.button("📥 Ambil Data Grafik"):
         st.success(f"Berhasil! Total data: {len(out)}")
         st.dataframe(out, use_container_width=True)
 
-        # download CSV
         st.download_button(
             "⬇️ Download CSV",
             data=out.to_csv(index=False).encode("utf-8-sig"),
@@ -201,4 +226,3 @@ if st.button("📥 Ambil Data Grafik"):
 
     except Exception as e:
         st.error(str(e))
-
