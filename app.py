@@ -1,37 +1,16 @@
-# -*- coding: utf-8 -*-
-"""
-Pegadaian Gold Chart Extractor (GraphQL allGrafik)
-- Fetch GraphQL data
-- Parse json_fluktuasi (double-encoded JSON)
-- Export to CSV (date, harga_beli, harga_jual)
-
-Dependencies:
-  pip install requests pandas
-"""
-
-from __future__ import annotations
+# app.py
+# pip install streamlit requests pandas
 
 import json
-from typing import Any, Dict, List, Optional
-
+import time
 import requests
 import pandas as pd
+import streamlit as st
 
+st.set_page_config(page_title="Pegadaian Grafik Emas Extractor", layout="wide")
 
-# 1) Set this from DevTools -> Network -> graphql -> Headers -> Request URL
-GRAPHQL_URL = "https://pegadaian.co.id/graphql"  # <-- GANTI sesuai Request URL yang kamu lihat
+DEFAULT_REFERER = "https://pegadaian.co.id/produk/harga-emas-batangan-dan-tabungan-tabungan-emas"
 
-# 2) Optional: sometimes you need headers/cookies. Start minimal first.
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    # "User-Agent": "Mozilla/5.0 ...",  # optional
-    # "Origin": "https://pegadaian.co.id",  # optional
-    # "Referer": "https://pegadaian.co.id/produk/harga-emas-batangan-dan-tabungan-tabungan-emas",  # optional
-    # "Cookie": "xxx=yyy; ..."  # only if API requires it
-}
-
-# GraphQL query exactly like in DevTools Payload
 QUERY_ALL_GRAFIK = """
 query allGrafik {
   allGrafik {
@@ -45,118 +24,165 @@ query allGrafik {
 }
 """
 
-
-def fetch_all_grafik() -> List[Dict[str, Any]]:
-    payload = {
-        "operationName": "allGrafik",
-        "variables": {},
-        "query": QUERY_ALL_GRAFIK,
+def build_headers(extra_headers: dict | None = None) -> dict:
+    # Header minimal agar request “mirip browser”
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": "https://pegadaian.co.id",
+        "Referer": DEFAULT_REFERER,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
     }
-    r = requests.post(GRAPHQL_URL, headers=HEADERS, json=payload, timeout=30)
-    r.raise_for_status()
+    if extra_headers:
+        # extra_headers boleh berisi Cookie / Authorization dll
+        headers.update({k: v for k, v in extra_headers.items() if v})
+    return headers
 
-    data = r.json()
-    if "errors" in data:
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
+def post_graphql(url: str, headers: dict, timeout: int = 30) -> requests.Response:
+    payload = {"operationName": "allGrafik", "variables": {}, "query": QUERY_ALL_GRAFIK}
+    s = requests.Session()
+    # retry ringan untuk 429/5xx
+    for attempt in range(3):
+        r = s.post(url, headers=headers, json=payload, timeout=timeout, allow_redirects=True)
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        return r
+    return r
 
-    return data["data"]["allGrafik"]
-
-
-def parse_json_fluktuasi(json_fluktuasi: str) -> List[Dict[str, Any]]:
-    """
-    json_fluktuasi is usually a JSON string that contains something like:
-      {"pricedlist":[{"lastUpdate":"...","hargaBeli":"...","hargaJual":"..."}, ...]}
-    Sometimes it's wrapped inside a list: [{"pricedlist":[...]}]
-    This function returns the pricedlist array.
-    """
-    # First parse (turn string -> object)
+def parse_json_fluktuasi(json_fluktuasi: str):
+    # json_fluktuasi sering berupa STRING JSON
     obj = json.loads(json_fluktuasi)
 
-    # If wrapped in list, take the first element
-    if isinstance(obj, list) and len(obj) > 0:
+    # kadang dibungkus list: [{...}]
+    if isinstance(obj, list) and obj:
         obj = obj[0]
 
     if not isinstance(obj, dict):
-        raise ValueError("Unexpected json_fluktuasi structure (not dict/list).")
+        raise ValueError("Struktur json_fluktuasi tidak sesuai (bukan dict/list).")
 
     pricedlist = obj.get("pricedlist", [])
     if not isinstance(pricedlist, list):
-        raise ValueError("Unexpected pricedlist structure (not list).")
-
+        raise ValueError("Struktur pricedlist tidak sesuai (bukan list).")
     return pricedlist
 
-
-def pick_record(records: List[Dict[str, Any]], tipe: Optional[str] = None, time_interval: Optional[int] = None) -> Dict[str, Any]:
-    """
-    Choose which allGrafik record to use.
-    - tipe: e.g., "beli" or "jual"
-    - time_interval: e.g., 360 (≈ 1 tahun)
-    If not provided, it returns the first record.
-    """
-    if tipe is None and time_interval is None:
-        return records[0]
-
-    for rec in records:
-        if tipe is not None and str(rec.get("tipe", "")).lower() != tipe.lower():
-            continue
-        if time_interval is not None and int(rec.get("time_interval", -1)) != int(time_interval):
-            continue
-        return rec
-
-    raise ValueError(f"Record not found for tipe={tipe}, time_interval={time_interval}")
-
-
-def to_dataframe(pricedlist: List[Dict[str, Any]]) -> pd.DataFrame:
+def to_df(pricedlist):
     df = pd.DataFrame(pricedlist)
 
-    # Normalize columns
-    # Common keys found: lastUpdate, hargaBeli, hargaJual
+    # normalisasi tanggal
     if "lastUpdate" in df.columns:
         df["tanggal"] = pd.to_datetime(df["lastUpdate"], errors="coerce").dt.date
     elif "tanggal" in df.columns:
         df["tanggal"] = pd.to_datetime(df["tanggal"], errors="coerce").dt.date
     else:
-        # If date key is different, keep as-is
-        df["tanggal"] = None
+        df["tanggal"] = pd.NaT
 
-    # Convert prices to numeric (string -> int)
-    for col_src, col_dst in [("hargaBeli", "harga_beli"), ("hargaJual", "harga_jual")]:
-        if col_src in df.columns:
-            df[col_dst] = pd.to_numeric(df[col_src], errors="coerce")
+    # normalisasi harga
+    for src, dst in [("hargaBeli", "harga_beli"), ("hargaJual", "harga_jual")]:
+        if src in df.columns:
+            df[dst] = pd.to_numeric(df[src], errors="coerce")
         else:
-            df[col_dst] = pd.NA
+            df[dst] = pd.NA
 
-    # Keep only essential columns (plus any you want)
     out = df[["tanggal", "harga_beli", "harga_jual"]].copy()
-
-    # Sort by date
     out = out.sort_values("tanggal").reset_index(drop=True)
     return out
 
+st.title("📈 Pegadaian — Extract Data Angka dari Grafik")
 
-def main():
-    all_grafik = fetch_all_grafik()
+with st.expander("⚙️ Konfigurasi", expanded=True):
+    # Ambil dari secrets kalau ada
+    secret_url = st.secrets.get("GRAPHQL_URL", "")
+    secret_cookie = st.secrets.get("COOKIE", "")
+    secret_auth = st.secrets.get("AUTHORIZATION", "")
+    secret_referer = st.secrets.get("REFERER", DEFAULT_REFERER)
 
-    # === Pilih dataset yang kamu mau ===
-    # Dari screenshot kamu: tipe="beli", time_interval=360 (≈ 1 tahun)
-    rec = pick_record(all_grafik, tipe="beli", time_interval=360)
+    graphql_url = st.text_input(
+        "GraphQL URL (copy dari DevTools → Network → graphql → Headers → Request URL)",
+        value=secret_url or "https://pegadaian.co.id/graphql",
+    )
 
-    pricedlist = parse_json_fluktuasi(rec["json_fluktuasi"])
-    df = to_dataframe(pricedlist)
+    referer = st.text_input("Referer", value=secret_referer)
+    cookie = st.text_area("Cookie (opsional, hanya jika diperlukan)", value=secret_cookie, height=80)
+    authorization = st.text_input("Authorization (opsional)", value=secret_auth)
 
-    # Save to CSV
-    csv_path = "pegadaian_grafik_emas_1tahun.csv"
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    tipe = st.selectbox("Pilih tipe", ["beli", "jual"])
+    time_interval = st.number_input("Pilih time_interval (mis. 360=1 tahun)", min_value=1, value=360, step=1)
 
-    # Also save to Excel
-    xlsx_path = "pegadaian_grafik_emas_1tahun.xlsx"
-    df.to_excel(xlsx_path, index=False)
+extra_headers = {
+    "Referer": referer,
+    "Cookie": cookie.strip() if cookie else "",
+    "Authorization": authorization.strip() if authorization else "",
+}
+headers = build_headers(extra_headers)
 
-    print("OK! Saved:")
-    print(" -", csv_path)
-    print(" -", xlsx_path)
-    print(df.head(10))
+colA, colB = st.columns(2)
 
+with colA:
+    if st.button("🔌 Test Connection"):
+        try:
+            r = post_graphql(graphql_url, headers=headers, timeout=30)
+            st.write("Status:", r.status_code)
+            st.write("Final URL:", r.url)
+            st.write("Response headers (subset):", {k: r.headers.get(k) for k in ["content-type", "server", "cf-ray"]})
+            # tampilkan snippet supaya kelihatan error WAF/HTML/JSON
+            st.code(r.text[:1500])
+        except Exception as e:
+            st.error(f"Test gagal: {e}")
 
-if __name__ == "__main__":
-    main()
+with colB:
+    st.caption("Jika status 403/406/429 atau response berisi HTML/Cloudflare, berarti diblok dari Streamlit Cloud.")
+
+st.divider()
+
+if st.button("📥 Ambil Data Grafik"):
+    try:
+        r = post_graphql(graphql_url, headers=headers, timeout=30)
+
+        # Jangan langsung raise_for_status, tampilkan detail dulu kalau gagal
+        if r.status_code != 200:
+            st.error(f"HTTP {r.status_code}")
+            st.code(r.text[:2000])
+            st.stop()
+
+        data = r.json()
+        if "errors" in data:
+            st.error("GraphQL mengembalikan errors")
+            st.json(data["errors"])
+            st.stop()
+
+        records = data["data"]["allGrafik"]
+
+        # cari record yang cocok
+        chosen = None
+        for rec in records:
+            if str(rec.get("tipe", "")).lower() == tipe.lower() and int(rec.get("time_interval", -1)) == int(time_interval):
+                chosen = rec
+                break
+        if not chosen:
+            st.warning("Record tidak ketemu. Ini daftar kombinasi yang tersedia:")
+            combos = sorted({(str(x.get("tipe")).lower(), int(x.get("time_interval"))) for x in records})
+            st.write(combos)
+            st.stop()
+
+        pricedlist = parse_json_fluktuasi(chosen["json_fluktuasi"])
+        df = to_df(pricedlist)
+
+        st.success(f"Berhasil! Rows: {len(df)} | tipe={tipe} | time_interval={time_interval}")
+        st.dataframe(df, use_container_width=True)
+
+        # download csv
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_bytes,
+            file_name=f"pegadaian_grafik_{tipe}_{time_interval}.csv",
+            mime="text/csv",
+        )
+
+    except Exception as e:
+        st.error(f"Gagal ambil data: {e}")
